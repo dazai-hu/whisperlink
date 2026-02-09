@@ -1,173 +1,86 @@
 
 import { User, Message } from '../types';
-import { EPHEMERAL_DURATION_MS } from '../constants';
+import { io, Socket } from 'socket.io-client';
 
-/**
- * A service that simulates a backend database with LocalStorage.
- * In a real app, this would be an API + WebSocket backend.
- */
 class DBService {
-  private USERS_KEY = 'whisperlink_users';
-  private MESSAGES_KEY = 'whisperlink_messages';
+  private socket: Socket;
+  private baseUrl = window.location.origin;
 
   constructor() {
-    this.startCleanupJob();
+    this.socket = io(this.baseUrl);
+    this.socket.on('db_update', () => {
+      window.dispatchEvent(new Event('storage'));
+    });
   }
-
-  private startCleanupJob() {
-    setInterval(() => {
-      this.cleanupExpiredMessages();
-    }, 5000);
-  }
-
-  private getUsers(): User[] {
-    const data = localStorage.getItem(this.USERS_KEY);
-    return data ? JSON.parse(data) : [];
-  }
-
-  private saveUsers(users: User[]) {
-    localStorage.setItem(this.USERS_KEY, JSON.stringify(users));
-  }
-
-  private getMessages(): Message[] {
-    const data = localStorage.getItem(this.MESSAGES_KEY);
-    return data ? JSON.parse(data) : [];
-  }
-
-  private saveMessages(messages: Message[]) {
-    localStorage.setItem(this.MESSAGES_KEY, JSON.stringify(messages));
-  }
-
-  // --- PUBLIC API ---
 
   async createUser(username: string, passwordHash: string): Promise<User> {
-    const users = this.getUsers();
-    if (users.find(u => u.username.toLowerCase() === username.toLowerCase())) {
-      throw new Error('Username already exists');
+    const res = await fetch(`${this.baseUrl}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password: passwordHash })
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'Failed to register');
     }
-    const newUser: User = {
-      id: Math.random().toString(36).substr(2, 9),
-      username,
-      passwordHash,
-      createdAt: Date.now(),
-      bio: 'Whispering in the leaves...'
-    };
-    users.push(newUser);
-    this.saveUsers(users);
-    return newUser;
+    return res.json();
   }
 
   async findUserByUsername(username: string): Promise<User | null> {
-    const users = this.getUsers();
-    return users.find(u => u.username.toLowerCase() === username.toLowerCase()) || null;
+    const res = await fetch(`${this.baseUrl}/api/users/search/${username}`);
+    if (!res.ok) return null;
+    return res.json();
   }
 
   async findUserById(id: string): Promise<User | null> {
-    const users = this.getUsers();
-    return users.find(u => u.id === id) || null;
+    const res = await fetch(`${this.baseUrl}/api/users/${id}`);
+    if (!res.ok) return null;
+    return res.json();
   }
 
   async updateUserProfile(userId: string, data: { avatar?: string, bio?: string }): Promise<User> {
-    const users = this.getUsers();
-    const idx = users.findIndex(u => u.id === userId);
-    if (idx === -1) throw new Error('User not found');
-    
-    users[idx] = { ...users[idx], ...data };
-    this.saveUsers(users);
-    
-    // Also update current session if it's the same user
+    const res = await fetch(`${this.baseUrl}/api/users/${userId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    const updated = await res.json();
     const session = localStorage.getItem('whisperlink_session');
     if (session) {
-      const sessionUser = JSON.parse(session);
-      if (sessionUser.id === userId) {
-        localStorage.setItem('whisperlink_session', JSON.stringify(users[idx]));
+      const user = JSON.parse(session);
+      if (user.id === userId) {
+        localStorage.setItem('whisperlink_session', JSON.stringify(updated));
       }
     }
-    
-    return users[idx];
+    return updated;
   }
 
-  async sendMessage(senderId: string, receiverId: string, type: 'text' | 'image', content: string): Promise<Message> {
-    const messages = this.getMessages();
-    const newMessage: Message = {
-      id: Math.random().toString(36).substr(2, 9),
-      senderId,
-      receiverId,
-      type,
-      content,
-      timestamp: Date.now(),
-      viewedAt: null,
-      expiresAt: null
-    };
-    messages.push(newMessage);
-    this.saveMessages(messages);
-    return newMessage;
+  async sendMessage(senderId: string, receiverId: string, type: 'text' | 'image', content: string): Promise<void> {
+    this.socket.emit('send_message', { senderId, receiverId, type, content });
   }
 
   async getChatMessages(userId1: string, userId2: string): Promise<Message[]> {
-    const messages = this.getMessages();
-    return messages.filter(m => 
-      (m.senderId === userId1 && m.receiverId === userId2) ||
-      (m.senderId === userId2 && m.receiverId === userId1)
-    ).sort((a, b) => a.timestamp - b.timestamp);
+    const res = await fetch(`${this.baseUrl}/api/messages/${userId1}/${userId2}`);
+    return res.json();
   }
 
   async markAsViewed(messageId: string): Promise<void> {
-    const messages = this.getMessages();
-    const idx = messages.findIndex(m => m.id === messageId);
-    if (idx !== -1 && !messages[idx].viewedAt) {
-      const now = Date.now();
-      messages[idx].viewedAt = now;
-      messages[idx].expiresAt = now + EPHEMERAL_DURATION_MS;
-      this.saveMessages(messages);
-    }
-  }
-
-  private cleanupExpiredMessages() {
-    const now = Date.now();
-    let messages = this.getMessages();
-    const initialCount = messages.length;
-    messages = messages.filter(m => {
-      if (m.expiresAt && now >= m.expiresAt) return false;
-      return true;
-    });
-    if (messages.length !== initialCount) {
-      this.saveMessages(messages);
-      window.dispatchEvent(new Event('storage'));
-    }
+    this.socket.emit('mark_viewed', messageId);
   }
 
   async getRecentChats(userId: string): Promise<{ otherUser: User, lastMessage: Message | null, unreadCount: number }[]> {
-    const allMessages = this.getMessages();
-    const users = this.getUsers();
-    const interactedUserIds = new Set<string>();
-    allMessages.forEach(m => {
-      if (m.senderId === userId) interactedUserIds.add(m.receiverId);
-      if (m.receiverId === userId) interactedUserIds.add(m.senderId);
-    });
+    const res = await fetch(`${this.baseUrl}/api/chats/${userId}`);
+    return res.json();
+  }
 
-    const results = Array.from(interactedUserIds).map(otherId => {
-      const otherUser = users.find(u => u.id === otherId)!;
-      if (!otherUser) return null;
-      const chatMessages = allMessages.filter(m => 
-        (m.senderId === userId && m.receiverId === otherId) ||
-        (m.senderId === otherId && m.receiverId === userId)
-      ).sort((a, b) => b.timestamp - a.timestamp);
-
-      const unreadCount = chatMessages.filter(m => m.receiverId === userId && !m.viewedAt).length;
-
-      return {
-        otherUser,
-        lastMessage: chatMessages[0] || null,
-        unreadCount
-      };
-    }).filter(x => x !== null) as { otherUser: User, lastMessage: Message | null, unreadCount: number }[];
-
-    return results.sort((a, b) => {
-      const timeA = a.lastMessage?.timestamp || 0;
-      const timeB = b.lastMessage?.timestamp || 0;
-      return timeB - timeA;
-    });
+  subscribeToMessages(userId: string, callback: () => void) {
+    this.socket.emit('join', userId);
+    this.socket.on('new_message', callback);
+    this.socket.on('message_updated', callback);
+    return () => {
+      this.socket.off('new_message', callback);
+      this.socket.off('message_updated', callback);
+    };
   }
 }
 
