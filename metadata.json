@@ -1,0 +1,7 @@
+{
+  "name": "WhisperLink",
+  "description": "A calm, privacy-focused ephemeral messaging app with an anime-inspired aesthetic, featuring 5-minute self-destructing messages and username-only authentication.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
