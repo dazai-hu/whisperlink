@@ -55,8 +55,8 @@ class DBService {
     return updated;
   }
 
-  async sendMessage(senderId: string, receiverId: string, type: 'text' | 'image', content: string): Promise<void> {
-    this.socket.emit('send_message', { senderId, receiverId, type, content });
+  async sendMessage(senderId: string, receiverId: string, type: 'text' | 'image', content: string, duration?: number): Promise<void> {
+    this.socket.emit('send_message', { senderId, receiverId, type, content, duration });
   }
 
   async getChatMessages(userId1: string, userId2: string): Promise<Message[]> {

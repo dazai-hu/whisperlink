@@ -6,6 +6,8 @@ export interface User {
   createdAt: number;
   avatar?: string; // base64 string
   bio?: string;
+  role?: 'admin' | 'user';
+  isBanned?: boolean;
 }
 
 export type MessageType = 'text' | 'image';
@@ -19,6 +21,7 @@ export interface Message {
   timestamp: number;
   viewedAt: number | null; // null if not yet opened
   expiresAt: number | null; // timestamp when it should be deleted
+  duration?: number; // custom duration in milliseconds
 }
 
 export interface ChatPreview {

@@ -1,3 +1,4 @@
+
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
@@ -24,8 +25,26 @@ app.use(express.static(distPath));
 // In-memory "Database"
 let users = [];
 let messages = [];
+let contacts = []; // Tracks established links between users: { u1, u2 }
 
-const EPHEMERAL_DURATION_MS = 5 * 60 * 1000;
+// Seed Admin User
+const seedAdmin = () => {
+  const adminExists = users.find(u => u.username.toLowerCase() === 'aadi');
+  if (!adminExists) {
+    users.push({
+      id: 'admin-001',
+      username: 'Aadi',
+      passwordHash: 'Aadi@7411',
+      bio: 'The architect of Silence.',
+      createdAt: Date.now(),
+      role: 'admin',
+      isBanned: false
+    });
+  }
+};
+seedAdmin();
+
+const DEFAULT_DURATION_MS = 5 * 60 * 1000;
 
 // Cleanup Job: Runs every 5 seconds
 setInterval(() => {
@@ -49,7 +68,9 @@ app.post('/api/auth/register', (req, res) => {
     username,
     passwordHash: password,
     bio: 'Whispering in the leaves...',
-    createdAt: Date.now()
+    createdAt: Date.now(),
+    role: 'user',
+    isBanned: false
   };
   users.push(newUser);
   res.json(newUser);
@@ -57,9 +78,56 @@ app.post('/api/auth/register', (req, res) => {
 
 app.post('/api/auth/login', (req, res) => {
   const { username, password } = req.body;
-  const user = users.find(u => u.username.toLowerCase() === username.toLowerCase() && u.passwordHash === password);
+  const user = users.find(u => 
+    u.username.toLowerCase() === username.toLowerCase() && 
+    u.passwordHash === password
+  );
+  
   if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+  if (user.isBanned) return res.status(403).json({ error: 'Identity revoked.' });
+  
   res.json(user);
+});
+
+// Admin Panel Access Gate (Internal check)
+app.post('/api/admin/login', (req, res) => {
+  const { username, password } = req.body;
+  if (username?.toLowerCase() === 'aadi' && password?.toLowerCase() === 'hello') {
+    return res.json({ success: true, token: 'admin-session-' + Date.now() });
+  }
+  res.status(401).json({ error: 'Access Denied' });
+});
+
+// Admin User Management
+app.get('/api/admin/users', (req, res) => {
+  // Returns user list without passwords
+  const list = users.map(({ passwordHash, ...u }) => u);
+  res.json(list);
+});
+
+app.delete('/api/admin/users/:id', (req, res) => {
+  const { id } = req.params;
+  const user = users.find(u => u.id === id);
+  if (user && user.role === 'admin') return res.status(403).json({ error: 'Cannot delete admin' });
+  
+  users = users.filter(u => u.id !== id);
+  contacts = contacts.filter(c => c.u1 !== id && c.u2 !== id);
+  messages = messages.filter(m => m.senderId !== id && m.receiverId !== id);
+  
+  io.emit('db_update');
+  res.json({ success: true });
+});
+
+app.patch('/api/admin/users/:id/ban', (req, res) => {
+  const { id } = req.params;
+  const user = users.find(u => u.id === id);
+  if (user) {
+    if (user.role === 'admin') return res.status(403).json({ error: 'Cannot ban admin' });
+    user.isBanned = !user.isBanned;
+    res.json(user);
+  } else {
+    res.status(404).json({ error: 'Not found' });
+  }
 });
 
 app.get('/api/users/:id', (req, res) => {
@@ -93,9 +161,9 @@ app.get('/api/messages/:u1/:u2', (req, res) => {
 app.get('/api/chats/:userId', (req, res) => {
   const { userId } = req.params;
   const interactedIds = new Set();
-  messages.forEach(m => {
-    if (m.senderId === userId) interactedIds.add(m.receiverId);
-    if (m.receiverId === userId) interactedIds.add(m.senderId);
+  contacts.forEach(c => {
+    if (c.u1 === userId) interactedIds.add(c.u2);
+    if (c.u2 === userId) interactedIds.add(c.u1);
   });
 
   const results = Array.from(interactedIds).map(id => {
@@ -106,48 +174,45 @@ app.get('/api/chats/:userId', (req, res) => {
       (m.senderId === id && m.receiverId === userId)
     ).sort((a, b) => b.timestamp - a.timestamp);
     const unreadCount = chat.filter(m => m.receiverId === userId && !m.viewedAt).length;
-    return { otherUser, lastMessage: chat[0], unreadCount };
+    return { otherUser, lastMessage: chat[0] || null, unreadCount };
   }).filter(Boolean);
-
   res.json(results);
 });
 
-// WebSocket logic
 io.on('connection', (socket) => {
   socket.on('join', (userId) => {
     socket.join(userId);
   });
-
   socket.on('send_message', (data) => {
+    const { senderId, receiverId } = data;
+    const linkExists = contacts.find(c => (c.u1 === senderId && c.u2 === receiverId) || (c.u1 === receiverId && c.u2 === senderId));
+    if (!linkExists) contacts.push({ u1: senderId, u2: receiverId });
     const msg = {
       id: Math.random().toString(36).substr(2, 9),
       ...data,
       timestamp: Date.now(),
       viewedAt: null,
-      expiresAt: null
+      expiresAt: null,
+      duration: data.duration || DEFAULT_DURATION_MS
     };
     messages.push(msg);
-    io.to(data.receiverId).emit('new_message', msg);
-    io.to(data.senderId).emit('new_message', msg);
+    io.to(receiverId).emit('new_message', msg);
+    io.to(senderId).emit('new_message', msg);
   });
-
   socket.on('mark_viewed', (messageId) => {
     const msg = messages.find(m => m.id === messageId);
     if (msg && !msg.viewedAt) {
       msg.viewedAt = Date.now();
-      msg.expiresAt = msg.viewedAt + EPHEMERAL_DURATION_MS;
+      msg.expiresAt = msg.viewedAt + (msg.duration || DEFAULT_DURATION_MS);
       io.to(msg.senderId).emit('message_updated', msg);
       io.to(msg.receiverId).emit('message_updated', msg);
     }
   });
 });
 
-// Fallback to SPA routing - must be after other routes
 app.get('*', (req, res) => {
   res.sendFile(path.join(distPath, 'index.html'), (err) => {
-    if (err) {
-      res.status(500).send("Build not found. Please run 'npm run build' first.");
-    }
+    if (err) res.status(500).send("Build not found.");
   });
 });
 
